@@ -14,13 +14,34 @@ async function getWasmInstance(): Promise<WebAssembly.Instance | null> {
       if (!response.ok) return null;
       const buffer = await response.arrayBuffer();
 
-      // Lightweight WASI stubs for the WebAssembly reactor
-      const wasiShim = new Proxy({}, {
-        get: () => (..._args: any[]) => 0
+      // WASI syscall stubs for the WebAssembly reactor
+      // In wasi-libc, __wasilibc_populate_preopens calls fd_prestat_get(fd, ...) for fds starting from 3.
+      // Returning 0 causes it to expect a valid directory prestat. Returning 8 (EBADF - Bad file descriptor)
+      // signals the end of preopened file descriptors so initialization completes successfully without calling proc_exit.
+      const wasiShim: Record<string, any> = {
+        fd_prestat_get: (_fd: number, _buf: number) => 8, // __WASI_ERRNO_BADF = 8
+        fd_prestat_dir_name: (_fd: number, _path: number, _len: number) => 8,
+        fd_close: (_fd: number) => 0,
+        fd_seek: (_fd: number, _offset_low: number, _offset_high: number, _whence: number, _newOffset: number) => 0,
+        fd_write: (_fd: number, _iovs: number, _iovs_len: number, _nwritten: number) => 0,
+        fd_read: (_fd: number, _iovs: number, _iovs_len: number, _nread: number) => 0,
+        proc_exit: (rval: number) => {
+          console.warn('WASI proc_exit called with code:', rval);
+        },
+        environ_sizes_get: (_count: number, _size: number) => 0,
+        environ_get: (_environ: number, _environ_buf: number) => 0,
+        clock_time_get: (_id: number, _precision: bigint, _time: number) => 0
+      };
+
+      const wasiProxy = new Proxy(wasiShim, {
+        get: (target, prop: string) => {
+          if (prop in target) return target[prop];
+          return (..._args: any[]) => 0;
+        }
       });
 
       const { instance } = await WebAssembly.instantiate(buffer, {
-        wasi_snapshot_preview1: wasiShim,
+        wasi_snapshot_preview1: wasiProxy,
         env: {}
       });
 
@@ -32,7 +53,7 @@ async function getWasmInstance(): Promise<WebAssembly.Instance | null> {
       wasmInstance = instance;
       return instance;
     } catch (e) {
-      console.warn('WASM initialization skipped or failed:', e);
+      console.error('WASM initialization failed:', e);
       return null;
     }
   })();
